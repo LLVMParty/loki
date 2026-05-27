@@ -1,7 +1,8 @@
 {
   "name": "Loki",
-  "image": "loki-obfuscation:latest",
+  "image": "ghcr.io/llvmparty/loki:20230720-18.04-llvm9",
   "remoteUser": "user",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/home/user/loki,type=bind,consistency=cached",
   "workspaceFolder": "/home/user/loki",
   "runArgs": [
     "--privileged",
