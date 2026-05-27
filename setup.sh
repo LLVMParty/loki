@@ -9,6 +9,9 @@
 
 set -eu
 
+PARALLEL_JOBS=${PARALLEL_JOBS:-$(nproc)}
+export PARALLEL_JOBS
+
 if [ ! -f /.dockerenv ]; then
     echo "Did not find file '/.dockerenv' -- this script should be run inside our docker container"
     exit 1
