@@ -1,0 +1,17 @@
+{
+  "name": "Loki",
+  "image": "loki-obfuscation:latest",
+  "remoteUser": "user",
+  "workspaceFolder": "/home/user/loki",
+  "runArgs": [
+    "--privileged",
+    "--net=host",
+    "--mount", "type=tmpfs,destination=/tmp,tmpfs-mode=777",
+    "--ulimit", "msgqueue=2097152000",
+    "--shm-size=16G"
+  ],
+  "containerEnv": {
+    "PARALLEL_JOBS": "${localEnv:PARALLEL_JOBS}"
+  },
+  "postCreateCommand": "./setup.sh"
+}

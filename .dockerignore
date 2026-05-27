@@ -1,0 +1,19 @@
+# Never send Ubuntu Pro tokens/configs in the Docker build context.
+/pro-attach-config*.yaml
+
+# Local VCS/editor/runtime state.
+.git
+.vscode
+__pycache__/
+*.log
+plot*.pdf
+plot*.png
+/docker_data/bash_history
+/docker_data/zsh_history
+/docker_data/vscode-data/
+
+# Build outputs generated outside Docker.
+/loki/translator/build/
+/loki/obfuscator/target/
+/loki/z3/
+/lokiattack/Triton/

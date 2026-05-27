@@ -1,6 +1,6 @@
 wheel
 orderedset
-z3-solver
+z3-solver==4.8.7.0
 
 # Miasm dependencies
 future

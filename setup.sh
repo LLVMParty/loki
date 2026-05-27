@@ -24,7 +24,9 @@ pushd lokiattack > /dev/null
 python3 -m pip install wheel
 python3 -m pip install --user -r requirements.txt
 echo "Installing Triton (used for byte-level taint analysis)"
-if [ ! -d Triton ]; then
+if python3 -c 'import triton' >/dev/null 2>&1; then
+    echo "Triton is already installed. Skipping.."
+elif [ ! -d Triton ]; then
     rm -f /home/user/.pyenv/versions/3.9.0/lib/python3.9/site-packages/triton.so
     ./install_triton.sh
 else

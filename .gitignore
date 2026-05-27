@@ -7,3 +7,6 @@ __pycache__/
 plot*.pdf
 plot*.png
 *.log
+
+# Ubuntu Pro token/config used by docker_build.sh as a BuildKit secret
+/pro-attach-config*.yaml

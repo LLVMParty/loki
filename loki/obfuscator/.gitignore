@@ -1,5 +1,6 @@
 target
 *.lock
+!Cargo.lock
 alu*.txt
 byte_code.bin
 byte_code.txt

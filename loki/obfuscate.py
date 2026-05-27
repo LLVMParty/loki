@@ -145,7 +145,11 @@ def build_rust(build_timeout: int) -> bool:
         process = subprocess.run(
             cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=build_timeout
         )
-        output = prettify_str(process.stderr.decode())
+        output = prettify_str((process.stdout + process.stderr).decode())
+        if process.returncode != 0:
+            logger.error(f"Rust build failed:\n{output}")
+            os.chdir(cwd)
+            return False
     except subprocess.TimeoutExpired:
         logger.warning(f"Timeout for: {' '.join(cmd)}")
         os.chdir(cwd)
@@ -155,9 +159,6 @@ def build_rust(build_timeout: int) -> bool:
         os.chdir(cwd)
         return False
     os.chdir(cwd)
-    if "Finished release" not in output:
-        logger.error(f"Rust build failed:\n{output}")
-        return False
     return True
 
 
