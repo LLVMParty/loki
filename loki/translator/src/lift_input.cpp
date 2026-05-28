@@ -2,11 +2,13 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
 
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/LegacyPassManager.h>
@@ -18,6 +20,7 @@
 #include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/TargetRegistry.h>
+#include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils.h>
@@ -85,6 +88,7 @@ static_assert(il_op_str_count == kMaxIlOps,
 static map<Value *, string> value_identifiers;
 static unsigned value_identifier = 0;
 static unsigned memory_identifier = 0;
+static unsigned cfg_block_identifier = 0;
 
 static string generate_name() {
   return formatv("__id_{0}", value_identifier++);
@@ -92,6 +96,37 @@ static string generate_name() {
 
 static string generate_memory_name() {
   return formatv("__mem_{0}", memory_identifier++);
+}
+
+static string generate_block_name() {
+  return formatv("bb_{0}", cfg_block_identifier++);
+}
+
+static string json_escape(const string &input) {
+  string result;
+  for (char c : input) {
+    switch (c) {
+    case '\\':
+      result += "\\\\";
+      break;
+    case '"':
+      result += "\\\"";
+      break;
+    case '\n':
+      result += "\\n";
+      break;
+    case '\r':
+      result += "\\r";
+      break;
+    case '\t':
+      result += "\\t";
+      break;
+    default:
+      result += c;
+      break;
+    }
+  }
+  return result;
 }
 
 struct IlLinearExpr {
@@ -217,7 +252,7 @@ IlLinearExpr translate_int(Value &value, size_t value_sz = 0) {
   }
 
   if (isa<Argument>(&value) || isa<Instruction>(&value) ||
-      isa<Operator>(&value)) {
+      isa<Operator>(&value) || isa<GlobalValue>(&value)) {
     result.op = kIlReg;
     result.size = sz;
     result.name = generate_value_name(value);
@@ -837,15 +872,213 @@ vector<IlAssignment> translate(Instruction &instr) {
   return it->second(instr);
 }
 
+static string value_ref_json(Value *value) {
+  if (!value) {
+    return "null";
+  }
+
+  stringstream stream;
+  if (auto *constant = dyn_cast<ConstantInt>(value)) {
+    stream << R"({"const":)" << constant->getZExtValue()
+           << R"(,"size":)" << constant->getBitWidth() << "}";
+    return stream.str();
+  }
+
+  if (isa<Argument>(value) || isa<Instruction>(value) ||
+      isa<Operator>(value) || isa<GlobalValue>(value)) {
+    stream << R"({"reg":")" << json_escape(generate_value_name(*value)) << "\"}";
+    return stream.str();
+  }
+
+  string printed;
+  raw_string_ostream os(printed);
+  value->printAsOperand(os, false);
+  stream << R"({"value":")" << json_escape(os.str()) << "\"}";
+  return stream.str();
+}
+
+static string block_name(BasicBlock *block, map<BasicBlock *, string> &names) {
+  auto it = names.find(block);
+  if (it != names.end()) {
+    return it->second;
+  }
+
+  string name = block->hasName() ? block->getName().str() : generate_block_name();
+  names[block] = name;
+  return name;
+}
+
+static void insert_value_name_if_reg(Value *value, set<string> &values) {
+  if (!value || isa<BasicBlock>(value)) {
+    return;
+  }
+  if (isa<Constant>(value) && !isa<GlobalValue>(value)) {
+    return;
+  }
+  if (isa<Argument>(value) || isa<Instruction>(value) ||
+      isa<Operator>(value) || isa<GlobalValue>(value)) {
+    values.insert(generate_value_name(*value));
+  }
+}
+
+static vector<string> sorted_values(const set<string> &values) {
+  return vector<string>(values.begin(), values.end());
+}
+
+static void print_string_array(ofstream &out, const vector<string> &values) {
+  out << "[";
+  for (auto i = values.begin(), e = values.end(); i != e; ++i) {
+    out << "\"" << json_escape(*i) << "\"";
+    if (i + 1 != e) {
+      out << ",";
+    }
+  }
+  out << "]";
+}
+
+static void print_block_successors(ofstream &out, BasicBlock &bb,
+                                   map<BasicBlock *, string> &block_names) {
+  out << "[";
+  for (auto i = succ_begin(&bb), e = succ_end(&bb); i != e; ++i) {
+    out << "\"" << json_escape(block_name(*i, block_names)) << "\"";
+    if (std::next(i) != e) {
+      out << ",";
+    }
+  }
+  out << "]";
+}
+
+static void print_phi_metadata(ofstream &out, BasicBlock &bb,
+                               map<BasicBlock *, string> &block_names) {
+  out << "[";
+  bool first_phi = true;
+  for (auto &instr : bb) {
+    auto *phi = dyn_cast<PHINode>(&instr);
+    if (!phi) {
+      continue;
+    }
+    if (!first_phi) {
+      out << ",";
+    }
+    first_phi = false;
+    out << "{";
+    out << R"("name":")" << json_escape(generate_value_name(*phi)) << R"(",)";
+    out << R"("incoming":[)";
+    for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+      out << "{";
+      out << R"("block":")" << json_escape(block_name(phi->getIncomingBlock(i), block_names))
+          << R"(",)";
+      out << R"("value":)" << value_ref_json(phi->getIncomingValue(i));
+      out << "}";
+      if (i + 1 != phi->getNumIncomingValues()) {
+        out << ",";
+      }
+    }
+    out << "]}";
+  }
+  out << "]";
+}
+
+static void print_terminator_metadata(ofstream &out, BasicBlock &bb,
+                                      map<BasicBlock *, string> &block_names) {
+  auto *terminator = bb.getTerminator();
+  out << "{";
+  if (auto *branch = dyn_cast<BranchInst>(terminator)) {
+    if (branch->isConditional()) {
+      out << R"("kind":"condbr",)";
+      out << R"("condition":)" << value_ref_json(branch->getCondition()) << ",";
+      out << R"("true":")" << json_escape(block_name(branch->getSuccessor(0), block_names)) << R"(",)";
+      out << R"("false":")" << json_escape(block_name(branch->getSuccessor(1), block_names)) << R"(")";
+    } else {
+      out << R"("kind":"br",)";
+      out << R"("target":")" << json_escape(block_name(branch->getSuccessor(0), block_names)) << R"(")";
+    }
+  } else if (auto *sw = dyn_cast<SwitchInst>(terminator)) {
+    out << R"("kind":"switch",)";
+    out << R"("condition":)" << value_ref_json(sw->getCondition()) << ",";
+    out << R"("default":")" << json_escape(block_name(sw->getDefaultDest(), block_names)) << R"(",)";
+    out << R"("cases":[)";
+    bool first_case = true;
+    for (auto &switch_case : sw->cases()) {
+      if (!first_case) {
+        out << ",";
+      }
+      first_case = false;
+      out << "{";
+      out << R"("value":)" << switch_case.getCaseValue()->getZExtValue() << ",";
+      out << R"("target":")" << json_escape(block_name(switch_case.getCaseSuccessor(), block_names))
+          << R"(")";
+      out << "}";
+    }
+    out << "]";
+  } else if (auto *ret = dyn_cast<ReturnInst>(terminator)) {
+    out << R"("kind":"ret")";
+    if (ret->getReturnValue()) {
+      out << R"(,"value":)" << value_ref_json(ret->getReturnValue());
+    }
+  } else {
+    out << R"("kind":")" << json_escape(terminator->getOpcodeName()) << R"(")";
+  }
+  out << "}";
+}
+
+struct CfgBlockMetadata {
+  BasicBlock *block = nullptr;
+  size_t instruction_start = 0;
+  size_t instruction_count = 0;
+  set<string> live_in;
+  set<string> live_out;
+};
+
+static void collect_block_liveness(BasicBlock &bb, CfgBlockMetadata &metadata) {
+  for (auto &instr : bb) {
+    for (auto &operand : instr.operands()) {
+      Value *value = operand.get();
+      if (auto *incoming_block = dyn_cast<BasicBlock>(value)) {
+        (void)incoming_block;
+        continue;
+      }
+      if (auto *def_instr = dyn_cast<Instruction>(value)) {
+        if (def_instr->getParent() == &bb) {
+          continue;
+        }
+      }
+      insert_value_name_if_reg(value, metadata.live_in);
+    }
+
+    for (auto &use : instr.uses()) {
+      auto *user_instr = dyn_cast<Instruction>(use.getUser());
+      if (user_instr && user_instr->getParent() != &bb) {
+        metadata.live_out.insert(generate_value_name(instr));
+      }
+    }
+  }
+}
+
 bool lift(Function &f, const string& out_dir) {
   vector<IlAssignment> all_assignments;
+  vector<CfgBlockMetadata> cfg_blocks;
+  map<BasicBlock *, string> block_names;
 
-  for (auto &instr : instructions(f)) {
-    auto assignments = translate(instr);
+  for (auto &bb : f) {
+    block_name(&bb, block_names);
+  }
 
-    all_assignments.reserve(all_assignments.size() + assignments.size());
-    all_assignments.insert(all_assignments.end(), assignments.begin(),
-                           assignments.end());
+  for (auto &bb : f) {
+    CfgBlockMetadata metadata;
+    metadata.block = &bb;
+    metadata.instruction_start = all_assignments.size();
+
+    for (auto &instr : bb) {
+      auto assignments = translate(instr);
+      all_assignments.reserve(all_assignments.size() + assignments.size());
+      all_assignments.insert(all_assignments.end(), assignments.begin(),
+                             assignments.end());
+    }
+
+    metadata.instruction_count = all_assignments.size() - metadata.instruction_start;
+    collect_block_liveness(bb, metadata);
+    cfg_blocks.push_back(metadata);
   }
 
   ofstream outfilestream;
@@ -887,9 +1120,159 @@ bool lift(Function &f, const string& out_dir) {
     }
   }
 
-  outfilestream << "\n]\n";
+  outfilestream << "\n],\n";
+
+  outfilestream << R"("cfg":{)";
+  outfilestream << R"("entry":")" << json_escape(block_name(&f.getEntryBlock(), block_names))
+                << R"(",)";
+  outfilestream << R"("blocks":[)";
+  for (auto i = cfg_blocks.begin(), e = cfg_blocks.end(); i != e; ++i) {
+    BasicBlock &bb = *i->block;
+    outfilestream << "{";
+    outfilestream << R"("name":")" << json_escape(block_name(&bb, block_names)) << R"(",)";
+    outfilestream << R"("instruction_start":)" << i->instruction_start << ",";
+    outfilestream << R"("instruction_count":)" << i->instruction_count << ",";
+    outfilestream << R"("live_in":)";
+    print_string_array(outfilestream, sorted_values(i->live_in));
+    outfilestream << ",";
+    outfilestream << R"("live_out":)";
+    print_string_array(outfilestream, sorted_values(i->live_out));
+    outfilestream << ",";
+    outfilestream << R"("successors":)";
+    print_block_successors(outfilestream, bb, block_names);
+    outfilestream << ",";
+    outfilestream << R"("phis":)";
+    print_phi_metadata(outfilestream, bb, block_names);
+    outfilestream << ",";
+    outfilestream << R"("terminator":)";
+    print_terminator_metadata(outfilestream, bb, block_names);
+    outfilestream << "}";
+    if (i + 1 != e) {
+      outfilestream << ",";
+    }
+  }
+  outfilestream << "]}\n";
   outfilestream << "}\n";
 
+  return true;
+}
+
+static Function *annotation_function_operand(Value *value) {
+  if (!value) {
+    return nullptr;
+  }
+
+  value = value->stripPointerCasts();
+  if (auto *function = dyn_cast<Function>(value)) {
+    return function;
+  }
+
+  if (auto *constant_expr = dyn_cast<ConstantExpr>(value)) {
+    if (constant_expr->isCast()) {
+      return annotation_function_operand(constant_expr->getOperand(0));
+    }
+  }
+
+  return nullptr;
+}
+
+static string annotation_string_operand(Value *value) {
+  if (!value) {
+    return "";
+  }
+
+  value = value->stripPointerCasts();
+  if (auto *constant_expr = dyn_cast<ConstantExpr>(value)) {
+    if (constant_expr->getOpcode() == Instruction::GetElementPtr &&
+        constant_expr->getNumOperands() > 0) {
+      value = constant_expr->getOperand(0)->stripPointerCasts();
+    }
+  }
+
+  auto *global = dyn_cast<GlobalVariable>(value);
+  if (!global || !global->hasInitializer()) {
+    return "";
+  }
+
+  auto *array = dyn_cast<ConstantDataArray>(global->getInitializer());
+  if (!array || !array->isCString()) {
+    return "";
+  }
+
+  return array->getAsCString().str();
+}
+
+static vector<Function *> find_annotated_functions(Module &module,
+                                                   const string &annotation) {
+  vector<Function *> functions;
+  auto *annotations = module.getGlobalVariable("llvm.global.annotations");
+  if (!annotations || !annotations->hasInitializer()) {
+    return functions;
+  }
+
+  auto *annotation_array = dyn_cast<ConstantArray>(annotations->getInitializer());
+  if (!annotation_array) {
+    return functions;
+  }
+
+  set<Function *> seen;
+  for (auto &operand : annotation_array->operands()) {
+    auto *annotation_struct = dyn_cast<ConstantStruct>(operand.get());
+    if (!annotation_struct || annotation_struct->getNumOperands() < 2) {
+      continue;
+    }
+
+    Function *function = annotation_function_operand(annotation_struct->getOperand(0));
+    string text = annotation_string_operand(annotation_struct->getOperand(1));
+    if (function && text == annotation && seen.insert(function).second) {
+      functions.push_back(function);
+    }
+  }
+
+  return functions;
+}
+
+static bool lift_annotated_functions(vector<Function *> &functions,
+                                     const string &workdir) {
+  string functions_dir = workdir + "/functions";
+  if (auto err = llvm::sys::fs::create_directories(functions_dir)) {
+    errs() << "Could not create functions directory: " << err.message() << "\n";
+    return false;
+  }
+
+  ofstream manifest;
+  manifest.open(workdir + "/loki_functions_manifest.json");
+  manifest << "{\n";
+  manifest << R"("annotation":"loki_virtualize",)" << "\n";
+  manifest << R"("functions":[)" << "\n";
+
+  for (auto i = functions.begin(), e = functions.end(); i != e; ++i) {
+    Function *function = *i;
+    string function_name = function->getName().str();
+    string function_dir = functions_dir + "/" + function_name;
+    if (auto err = llvm::sys::fs::create_directories(function_dir)) {
+      errs() << "Could not create function directory for " << function_name
+             << ": " << err.message() << "\n";
+      return false;
+    }
+    if (!lift(*function, function_dir)) {
+      return false;
+    }
+
+    manifest << "{";
+    manifest << R"("name":")" << json_escape(function_name) << R"(",)";
+    manifest << R"("path":"functions/)" << json_escape(function_name)
+             << R"(/lifted_input.txt",)";
+    manifest << R"("args":)" << function->arg_size();
+    manifest << "}";
+    if (i + 1 != e) {
+      manifest << ",";
+    }
+    manifest << "\n";
+  }
+
+  manifest << "]\n";
+  manifest << "}\n";
   return true;
 }
 
@@ -903,8 +1286,17 @@ bool parse_module(const string& workdir) {
     return false;
   }
 
+  vector<Function *> target_functions;
+  bool using_legacy_target_function = false;
   auto target_function = module->getFunction("target_function");
-  if (!target_function) {
+  if (target_function) {
+    target_functions.push_back(target_function);
+    using_legacy_target_function = true;
+  } else {
+    target_functions = find_annotated_functions(*module, "loki_virtualize");
+  }
+  if (target_functions.empty()) {
+    errs() << "Could not find target_function or any loki_virtualize annotations.\n";
     return false;
   }
 
@@ -926,7 +1318,9 @@ bool parse_module(const string& workdir) {
   // execute the O3 optimizations:
   // - has to be done _before_ additional passes are executed
   fpm.doInitialization();
-  fpm.run(*target_function);
+  for (Function *function : target_functions) {
+    fpm.run(*function);
+  }
   fpm.doFinalization();
 
   // add the custom additional loop and memory optimizations:
@@ -957,7 +1351,9 @@ bool parse_module(const string& workdir) {
   fpm.add(simplify_cfg_pass_1);
 
   fpm.doInitialization();
-  fpm.run(*target_function);
+  for (Function *function : target_functions) {
+    fpm.run(*function);
+  }
   fpm.doFinalization();
 
   fpm.add(mem2reg_pass_2);
@@ -966,7 +1362,9 @@ bool parse_module(const string& workdir) {
   fpm.add(constprop_pass);
 
   fpm.doInitialization();
-  fpm.run(*target_function);
+  for (Function *function : target_functions) {
+    fpm.run(*function);
+  }
   fpm.doFinalization();
 
   // eliminate malloc/free of known size arrays
@@ -975,7 +1373,9 @@ bool parse_module(const string& workdir) {
   fpm.add(gep_pass);
 
   fpm.doInitialization();
-  fpm.run(*target_function);
+  for (Function *function : target_functions) {
+    fpm.run(*function);
+  }
   fpm.doFinalization();
 
   // Execute O3 Optimizations again:
@@ -983,7 +1383,9 @@ bool parse_module(const string& workdir) {
 
   // - has to be done _before_ additional passes are executed
   fpm.doInitialization();
-  fpm.run(*target_function);
+  for (Function *function : target_functions) {
+    fpm.run(*function);
+  }
   fpm.doFinalization();
 
   // dump this to file:
@@ -991,7 +1393,11 @@ bool parse_module(const string& workdir) {
   WriteBitcodeToFile(*module, OS);
   OS.flush();
 
-  if (!lift(*target_function, workdir)) {
+  if (using_legacy_target_function) {
+    if (!lift(*target_functions.front(), workdir)) {
+      return false;
+    }
+  } else if (!lift_annotated_functions(target_functions, workdir)) {
     return false;
   }
 

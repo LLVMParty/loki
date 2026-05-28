@@ -2076,6 +2076,25 @@ void vm_exit(Context &) {
 #endif
 }
 
+extern "C" __attribute__((visibility("default"))) uint64_t loki_vm_call(uint64_t vm_argv[]) {
+  vm_setup(vm_argv, context, 0);
+  return context.regs[kOffsetOutput];
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t loki_vm_enter(
+    uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
+  context.reset();
+  context.regs[kOffsetIp] = 0;
+
+  if (argument_count > 0) context.regs[argument_indices[0]] = arg0;
+  if (argument_count > 1) context.regs[argument_indices[1]] = arg1;
+  if (argument_count > 2) context.regs[argument_indices[2]] = arg2;
+  if (argument_count > 3) context.regs[argument_indices[3]] = arg3;
+
+  VM_NEXT;
+  return context.regs[kOffsetOutput];
+}
+
 uint64_t parse_input(char const *s, int base = 10) {
     if (s[0] == 's') {
       return (uint64_t)(s+1);
@@ -2113,14 +2132,14 @@ int main(int argc, char *argv[]) {
     printf("arg %d: 0x%lx\n", i, vm_argv[i]);
   }
   double duration_sum = 0;
-  int result = 0;
+  uint64_t result = 0;
   for (int i = 0; i < 10000; ++i) {
     auto t1 = std::chrono::high_resolution_clock::now();
-    vm_setup(vm_argv, context, 0);
+    result = loki_vm_call(vm_argv);
     auto t2 = std::chrono::high_resolution_clock::now();
     duration_sum += std::chrono::duration<double, std::micro>( t2 - t1 ).count();
   }
-  printf("Output: %lu\n", context.regs[kOffsetOutput]);
+  printf("Output: %lu\n", static_cast<uint64_t>(result));
   printf("Time: %lf\n", (duration_sum / 10000));
   printf("Done.\n");
   return 0;

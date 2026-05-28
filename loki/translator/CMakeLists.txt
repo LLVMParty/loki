@@ -125,7 +125,7 @@ set(VM_LIFT_ME ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/input_program.bc)
 
 add_custom_command(OUTPUT ${VM_TEMPLATE}
     COMMAND ${VM_TEMPLATE_COMPILER}
-    ARGS -c -emit-llvm --std=c++14 -O3 ${VM_TEMPLATE_IN} -o ${VM_TEMPLATE}
+    ARGS -c -emit-llvm --std=c++14 -O3 -fPIC ${VM_TEMPLATE_IN} -o ${VM_TEMPLATE}
     DEPENDS ${VM_TEMPLATE_IN}
     IMPLICIT_DEPENDS CXX
 )
@@ -153,6 +153,10 @@ add_executable(lift_input
     src/lift_input.cpp
 )
 
+add_executable(virtualize-uops
+    src/virtualize_uops.cpp
+)
+
 if (${LLVM_ENABLE_ASSERTIONS})
     target_compile_options(${BINARY_NAME} PRIVATE -UNDEBUG)
 else()
@@ -171,8 +175,15 @@ target_link_libraries(lift_input PRIVATE
     ${PROJECT_LINK_FLAGS}
 )
 
+link_directories(virtualize-uops PRIVATE ${LLVM_DIR}/lib)
+target_link_libraries(virtualize-uops PRIVATE
+    ${PROJECT_LIBRARIES}
+    ${PROJECT_LINK_FLAGS}
+)
+
 target_include_directories(${BINARY_NAME} SYSTEM PUBLIC ${PROJECT_INCLUDES})
 target_include_directories(lift_input SYSTEM PUBLIC ${PROJECT_INCLUDES})
+target_include_directories(virtualize-uops SYSTEM PUBLIC ${PROJECT_INCLUDES})
 
 target_compile_definitions(${BINARY_NAME} PUBLIC ${PROJECT_DEFINITIONS})
 target_compile_options(${BINARY_NAME} PRIVATE ${PROJECT_CXX_FLAGS})
@@ -180,5 +191,9 @@ target_compile_options(${BINARY_NAME} PRIVATE ${PROJECT_CXX_FLAGS})
 target_compile_definitions(lift_input PUBLIC ${PROJECT_DEFINITIONS})
 target_compile_options(lift_input PRIVATE ${PROJECT_CXX_FLAGS})
 
+target_compile_definitions(virtualize-uops PUBLIC ${PROJECT_DEFINITIONS})
+target_compile_options(virtualize-uops PRIVATE ${PROJECT_CXX_FLAGS})
+
 add_dependencies(lift_input test_input)
-add_dependencies(${BINARY_NAME} lift_input vm_template)
+add_dependencies(virtualize-uops vm_template)
+add_dependencies(${BINARY_NAME} lift_input virtualize-uops vm_template)

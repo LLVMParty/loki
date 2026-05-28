@@ -1,0 +1,25 @@
+LIBRARY vm_test_suite
+EXPORTS
+    vm01_xor
+    vm02_ops
+    vm03_mixed_width
+    vm04_division
+    vm05_select
+    vm06_single_jcc
+    vm07_ifelse
+    vm08_const_loop
+    vm09_counted_sum
+    vm10_do_while
+    vm11_exp_stride
+    vm12_loop_branch
+    vm13_switch4
+    vm14_switch12
+    vm15_switch_shared
+    vm16_xor_checksum
+    vm17_table_walk
+    vm18_out_param
+    vm19_global_alias
+    vm20_nested_loop
+    vm21_chain
+    vm22_opaque_mba
+    vm23_state_machine

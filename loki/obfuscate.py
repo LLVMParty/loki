@@ -222,12 +222,19 @@ def prettify_str(string: str) -> str:
     return string
 
 
-def enumerate_testcases(allowlist: List[str], denylist: List[str]) -> List[Path]:
+def enumerate_testcases(allowlist: List[str], denylist: List[str], testcase_paths: List[str]) -> List[Path]:
     """
     Enumerate all testcases included in allowlist.
-    If no allowlisted entry exists, enumerate all entries not on denylist
+    If explicit testcase paths are provided, use those instead of the testcase repository.
+    If no allowlisted entry exists, enumerate all entries not on denylist.
     """
-    testcases = []
+    if testcase_paths:
+        testcases = [Path(testcase).resolve() for testcase in testcase_paths]
+        for testcase in testcases:
+            assert_is_file(testcase)
+        logger.info(f"Found {len(testcases)} explicit testcases")
+        return testcases
+
     if allowlist:
         testcases = [
             Path(testcase) for testcase in TESTCASE_REPO.glob("**/*.c*") if testcase.name.split(".c")[0] in allowlist
@@ -587,7 +594,7 @@ def main(path: Path, args: Namespace) -> None:
     setup_builds(base_dir, args.timeout)
     workdir_path = prepare_eval_dir(path)
 
-    testcases: List[Path] = enumerate_testcases(args.allow, args.deny)
+    testcases: List[Path] = enumerate_testcases(args.allow, args.deny, args.testcase_path)
 
     for (i, testcase) in enumerate(testcases):
         logger.info(f"Inspecting {testcase.name} ({i+1}/{len(testcases)})")
@@ -608,6 +615,8 @@ if __name__ == "__main__":
     parser.add_argument("--allow", action="store", nargs="+", default=[], help="only run these tests")
     parser.add_argument("--deny", action="store", nargs="+", default=[],
                         help="avoid running these tests (ignored if allowlist is specified)")
+    parser.add_argument("--testcase-path", action="store", nargs="+", default=[],
+                        help="explicit testcase source files to run instead of enumerating ./testcases")
     parser.add_argument("--timeout", dest="timeout", action="store", type=int, default=BUILD_TIMEOUT,
                         help="timeout for build process via run.sh")
     parser.add_argument("--instances", dest="num_instances", action="store", type=int, default=NUM_INSTANCES,

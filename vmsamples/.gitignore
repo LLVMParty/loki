@@ -1,0 +1,10 @@
+DLLLoader*.exe
+*.dll
+*.exe
+*.lib
+*.map
+*.vmp
+*.zip
+build/
+liftcheck*/
+loki-eval/
