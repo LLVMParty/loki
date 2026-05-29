@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 
+#include <llvm/ADT/StringRef.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
@@ -15,6 +16,70 @@
 
 using namespace llvm;
 using namespace std;
+
+struct Options {
+  string input_path;
+  string output_path;
+  string annotation = "loki_virtualize";
+  bool use_annotation = true;
+  bool all_functions = false;
+  bool exported_functions = false;
+  vector<string> function_names;
+};
+
+static void print_usage() {
+  errs() << "Usage: virtualize-uops [options] <input.bc> <output.bc>\n"
+         << "Options:\n"
+         << "  --annotation <name>       Virtualize functions annotated with <name> "
+            "(default: loki_virtualize)\n"
+         << "  --no-annotation          Do not use annotation-based selection\n"
+         << "  --function <name>        Virtualize a named function; may be repeated\n"
+         << "  --exported-functions     Virtualize defined externally visible functions except main\n"
+         << "  --all-functions          Virtualize every defined non-intrinsic function\n";
+}
+
+static bool parse_options(int argc, char **argv, Options &options) {
+  vector<string> positional;
+  for (int i = 1; i < argc; ++i) {
+    string arg = argv[i];
+    if (arg == "--annotation") {
+      if (++i >= argc) {
+        errs() << "--annotation requires a value\n";
+        return false;
+      }
+      options.annotation = argv[i];
+      options.use_annotation = true;
+    } else if (arg == "--no-annotation") {
+      options.use_annotation = false;
+    } else if (arg == "--function") {
+      if (++i >= argc) {
+        errs() << "--function requires a value\n";
+        return false;
+      }
+      options.function_names.push_back(argv[i]);
+    } else if (arg == "--exported-functions") {
+      options.exported_functions = true;
+    } else if (arg == "--all-functions") {
+      options.all_functions = true;
+    } else if (arg == "--help" || arg == "-h") {
+      print_usage();
+      exit(0);
+    } else if (!arg.empty() && arg[0] == '-') {
+      errs() << "Unknown option: " << arg << "\n";
+      return false;
+    } else {
+      positional.push_back(arg);
+    }
+  }
+
+  if (positional.size() != 2) {
+    print_usage();
+    return false;
+  }
+  options.input_path = positional[0];
+  options.output_path = positional[1];
+  return true;
+}
 
 static Function *annotation_function_operand(Value *value) {
   if (!value) {
@@ -91,11 +156,77 @@ static vector<Function *> find_annotated_functions(Module &module,
   return functions;
 }
 
+static bool is_virtualizable_definition(Function &function) {
+  if (function.isDeclaration() || function.isIntrinsic()) {
+    return false;
+  }
+
+  StringRef name = function.getName();
+  return !name.startswith("llvm.") && !name.startswith("loki_vm_") &&
+         !name.startswith("vm_alu");
+}
+
+static bool has_exported_linkage(Function &function) {
+  if (!is_virtualizable_definition(function) || function.getName() == "main") {
+    return false;
+  }
+  return function.hasExternalLinkage() || function.hasExternalWeakLinkage() ||
+         function.hasWeakAnyLinkage() || function.hasWeakODRLinkage();
+}
+
+static void add_target(vector<Function *> &targets, set<Function *> &seen,
+                       Function *function) {
+  if (function && is_virtualizable_definition(*function) &&
+      seen.insert(function).second) {
+    targets.push_back(function);
+  }
+}
+
+static vector<Function *> select_targets(Module &module, const Options &options) {
+  vector<Function *> targets;
+  set<Function *> seen;
+
+  if (options.use_annotation) {
+    for (Function *function : find_annotated_functions(module, options.annotation)) {
+      add_target(targets, seen, function);
+    }
+  }
+
+  for (const string &name : options.function_names) {
+    Function *function = module.getFunction(name);
+    if (!function) {
+      errs() << "Function not found: " << name << "\n";
+      continue;
+    }
+    add_target(targets, seen, function);
+  }
+
+  if (options.exported_functions) {
+    for (Function &function : module) {
+      if (has_exported_linkage(function)) {
+        add_target(targets, seen, &function);
+      }
+    }
+  }
+
+  if (options.all_functions) {
+    for (Function &function : module) {
+      add_target(targets, seen, &function);
+    }
+  }
+
+  return targets;
+}
+
 static bool is_supported_int(Type *type) {
   return type->isIntegerTy() && type->getIntegerBitWidth() <= 64;
 }
 
-static Value *to_i64(IRBuilder<> &builder, Value *value) {
+static bool is_supported_scalar(Type *type) {
+  return is_supported_int(type) || type->isPointerTy();
+}
+
+static Value *int_to_i64(IRBuilder<> &builder, Value *value, bool sign_extend) {
   LLVMContext &context = builder.getContext();
   Type *i64 = Type::getInt64Ty(context);
   Type *type = value->getType();
@@ -103,20 +234,30 @@ static Value *to_i64(IRBuilder<> &builder, Value *value) {
   if (type == i64) {
     return value;
   }
-  if (type->isIntegerTy()) {
-    unsigned width = type->getIntegerBitWidth();
-    if (width < 64) {
-      return builder.CreateZExt(value, i64);
-    }
-    if (width > 64) {
-      return builder.CreateTrunc(value, i64);
-    }
-  }
-  if (type->isPointerTy()) {
-    return builder.CreatePtrToInt(value, i64);
+  if (!type->isIntegerTy()) {
+    return nullptr;
   }
 
+  unsigned width = type->getIntegerBitWidth();
+  if (width < 64) {
+    return sign_extend ? builder.CreateSExt(value, i64) : builder.CreateZExt(value, i64);
+  }
+  if (width > 64) {
+    return builder.CreateTrunc(value, i64);
+  }
   return nullptr;
+}
+
+static Value *to_i64_unsigned(IRBuilder<> &builder, Value *value) {
+  Type *type = value->getType();
+  if (type->isPointerTy()) {
+    return builder.CreatePtrToInt(value, Type::getInt64Ty(builder.getContext()));
+  }
+  return int_to_i64(builder, value, false);
+}
+
+static Value *to_i64_signed(IRBuilder<> &builder, Value *value) {
+  return int_to_i64(builder, value, true);
 }
 
 static Value *from_i64(IRBuilder<> &builder, Value *value, Type *type) {
@@ -131,6 +272,9 @@ static Value *from_i64(IRBuilder<> &builder, Value *value, Type *type) {
     if (width > 64) {
       return builder.CreateZExt(value, type);
     }
+  }
+  if (type->isPointerTy()) {
+    return builder.CreateIntToPtr(value, type);
   }
   return nullptr;
 }
@@ -159,6 +303,10 @@ static int opcode_for_binary(unsigned opcode) {
     return 10;
   case Instruction::AShr:
     return 25;
+  case Instruction::SDiv:
+    return 26;
+  case Instruction::SRem:
+    return 27;
   default:
     return -1;
   }
@@ -171,6 +319,11 @@ static FunctionCallee get_dispatch(Module &module) {
   return module.getOrInsertFunction("loki_vm_enter", func_type);
 }
 
+static bool is_signed_binary(unsigned opcode) {
+  return opcode == Instruction::AShr || opcode == Instruction::SDiv ||
+         opcode == Instruction::SRem;
+}
+
 static bool replace_binary(BinaryOperator *binary, FunctionCallee dispatch) {
   int opcode = opcode_for_binary(binary->getOpcode());
   if (opcode < 0 || !is_supported_int(binary->getType())) {
@@ -178,8 +331,13 @@ static bool replace_binary(BinaryOperator *binary, FunctionCallee dispatch) {
   }
 
   IRBuilder<> builder(binary);
-  Value *lhs = to_i64(builder, binary->getOperand(0));
-  Value *rhs = to_i64(builder, binary->getOperand(1));
+  bool signed_op = is_signed_binary(binary->getOpcode());
+  Value *lhs = signed_op ? to_i64_signed(builder, binary->getOperand(0))
+                         : to_i64_unsigned(builder, binary->getOperand(0));
+  Value *rhs = to_i64_unsigned(builder, binary->getOperand(1));
+  if (binary->getOpcode() == Instruction::SDiv || binary->getOpcode() == Instruction::SRem) {
+    rhs = to_i64_signed(builder, binary->getOperand(1));
+  }
   if (!lhs || !rhs) {
     return false;
   }
@@ -224,19 +382,32 @@ static int opcode_for_icmp(ICmpInst::Predicate predicate) {
   }
 }
 
+static bool is_signed_icmp(ICmpInst::Predicate predicate) {
+  return predicate == ICmpInst::ICMP_SLT || predicate == ICmpInst::ICMP_SLE ||
+         predicate == ICmpInst::ICMP_SGT || predicate == ICmpInst::ICMP_SGE;
+}
+
 static bool replace_icmp(ICmpInst *icmp, FunctionCallee dispatch) {
   int opcode = opcode_for_icmp(icmp->getPredicate());
   if (opcode < 0) {
     return false;
   }
-  if (!is_supported_int(icmp->getOperand(0)->getType()) ||
-      !is_supported_int(icmp->getOperand(1)->getType())) {
+
+  Type *operand_type = icmp->getOperand(0)->getType();
+  if (!is_supported_scalar(operand_type) ||
+      operand_type != icmp->getOperand(1)->getType()) {
+    return false;
+  }
+  if (operand_type->isPointerTy() && is_signed_icmp(icmp->getPredicate())) {
     return false;
   }
 
   IRBuilder<> builder(icmp);
-  Value *lhs = to_i64(builder, icmp->getOperand(0));
-  Value *rhs = to_i64(builder, icmp->getOperand(1));
+  bool signed_compare = is_signed_icmp(icmp->getPredicate());
+  Value *lhs = signed_compare ? to_i64_signed(builder, icmp->getOperand(0))
+                              : to_i64_unsigned(builder, icmp->getOperand(0));
+  Value *rhs = signed_compare ? to_i64_signed(builder, icmp->getOperand(1))
+                              : to_i64_unsigned(builder, icmp->getOperand(1));
   if (!lhs || !rhs) {
     return false;
   }
@@ -251,14 +422,17 @@ static bool replace_icmp(ICmpInst *icmp, FunctionCallee dispatch) {
 }
 
 static bool replace_select(SelectInst *select, FunctionCallee dispatch) {
-  if (!is_supported_int(select->getType())) {
+  if (!is_supported_scalar(select->getType())) {
+    return false;
+  }
+  if (!select->getCondition()->getType()->isIntegerTy(1)) {
     return false;
   }
 
   IRBuilder<> builder(select);
-  Value *true_value = to_i64(builder, select->getTrueValue());
-  Value *false_value = to_i64(builder, select->getFalseValue());
-  Value *condition = to_i64(builder, select->getCondition());
+  Value *true_value = to_i64_unsigned(builder, select->getTrueValue());
+  Value *false_value = to_i64_unsigned(builder, select->getFalseValue());
+  Value *condition = to_i64_unsigned(builder, select->getCondition());
   if (!true_value || !false_value || !condition) {
     return false;
   }
@@ -299,22 +473,23 @@ static size_t virtualize_function(Function &function, FunctionCallee dispatch) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 3) {
-    errs() << "Usage: virtualize-uops <input.bc> <output.bc>\n";
+  Options options;
+  if (!parse_options(argc, argv, options)) {
     return 1;
   }
 
   LLVMContext context;
   SMDiagnostic error;
-  auto module = parseIRFile(argv[1], error, context);
+  auto module = parseIRFile(options.input_path, error, context);
   if (!module) {
     error.print("virtualize-uops", errs());
     return 1;
   }
 
-  auto targets = find_annotated_functions(*module, "loki_virtualize");
+  auto targets = select_targets(*module, options);
   if (targets.empty()) {
-    errs() << "No loki_virtualize annotations found.\n";
+    errs() << "No target functions selected. Use annotations, --function, "
+              "--exported-functions, or --all-functions.\n";
     return 1;
   }
 
@@ -332,7 +507,7 @@ int main(int argc, char **argv) {
   }
 
   error_code ec;
-  raw_fd_ostream output(argv[2], ec, sys::fs::F_None);
+  raw_fd_ostream output(options.output_path, ec, sys::fs::F_None);
   if (ec) {
     errs() << "Could not open output: " << ec.message() << "\n";
     return 1;

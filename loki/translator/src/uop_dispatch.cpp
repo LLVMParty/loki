@@ -14,6 +14,20 @@ extern "C" uint64_t target_function(uint64_t op, uint64_t a, uint64_t b, uint64_
     uint64_t sh = b & 63ull;
     uint64_t sel_mask = 0ull - (c & 1ull);
 
+    uint64_t sign_a = a >> 63;
+    uint64_t sign_b = b >> 63;
+    uint64_t abs_a = (a ^ (0ull - sign_a)) + sign_a;
+    uint64_t abs_b = (b ^ (0ull - sign_b)) + sign_b;
+    uint64_t safe_abs_b = abs_b | LOKI_IS_ZERO64(abs_b);
+    uint64_t signed_quotient = abs_a / safe_abs_b;
+    uint64_t signed_remainder = abs_a % safe_abs_b;
+    uint64_t quotient_sign = sign_a ^ sign_b;
+    uint64_t signed_div = (signed_quotient ^ (0ull - quotient_sign)) + quotient_sign;
+    uint64_t signed_rem = (signed_remainder ^ (0ull - sign_a)) + sign_a;
+    uint64_t ashr_fill = (0ull - sign_a) << ((64ull - sh) & 63ull);
+    ashr_fill &= 0ull - (LOKI_IS_ZERO64(sh) ^ 1ull);
+    uint64_t signed_shr = (a >> sh) | ashr_fill;
+
     uint64_t r = 0;
     r |= LOKI_MASK_EQ(op, 0)  & (a + b);
     r |= LOKI_MASK_EQ(op, 1)  & (a - b);
@@ -47,9 +61,9 @@ extern "C" uint64_t target_function(uint64_t op, uint64_t a, uint64_t b, uint64_
     r |= LOKI_MASK_EQ(op, 22) & (slt | eq);
     r |= LOKI_MASK_EQ(op, 23) & sgt;
     r |= LOKI_MASK_EQ(op, 24) & (sgt | eq);
-    r |= LOKI_MASK_EQ(op, 25) & static_cast<uint64_t>(static_cast<int64_t>(a) >> sh);
-    r |= LOKI_MASK_EQ(op, 26) & (a / safe_b);
-    r |= LOKI_MASK_EQ(op, 27) & (a % safe_b);
+    r |= LOKI_MASK_EQ(op, 25) & signed_shr;
+    r |= LOKI_MASK_EQ(op, 26) & signed_div;
+    r |= LOKI_MASK_EQ(op, 27) & signed_rem;
     return r;
 }
 
