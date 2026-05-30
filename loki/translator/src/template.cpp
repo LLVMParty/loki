@@ -536,7 +536,7 @@ constexpr size_t kOffsetIp = 1;
 
 struct Context {
   uint64_t regs[kRegCount];
-  void reset() { std::memset(regs, 0, kRegCount); }
+  void reset() { std::memset(regs, 0, sizeof(regs)); }
 };
 
 extern "C" {

@@ -1,0 +1,37 @@
+# Loki uop dispatch map v1
+# Keep this file to make repeated protections use the same external uop ABI.
+# Regenerate it only when you intentionally want a new protected ABI.
+
+encode_op_xor 0x6085fd98647c18d1
+encode_a_xor 0x61eb9df41527d67a
+encode_b_xor 0x9533ddde0433857e
+encode_c_xor 0x4c07bd05d235fb7f
+
+add 0x858fa6e874bff19d
+sub 0x9bb8761b19cb0e5e
+xor 0xdc7d2ef682808690
+and 0x48bcc4aaeb6de9ed
+or 0x8711f219609f78ab
+mul 0x5d47789a1620f932
+lshr 0x413379bc09a169b3
+shl 0x4a442bed4f44eaa9
+not 0xa5e6b37ab2f8a499
+udiv 0x1a9a4efc2a87ed7d
+urem 0x030cdecd19d256c8
+eq 0x4dadc309c09a5a0a
+iszero 0x9e1a81e5ea0d6be4
+select 0xa339eb0bdf30a651
+addc 0xab73e263c08dd9f1
+xorc 0xa747760865de29e9
+ne 0xfd5c00ef468f3151
+ult 0x0c8536dd3513962f
+ule 0x2521ac88e5896054
+ugt 0x93f8299a972f1dfe
+uge 0xfda8e89e839ab4b5
+slt 0x3d72c129e4374445
+sle 0xeca71578432b1fd9
+sgt 0xd693de88938b7c39
+sge 0xdc1ab69661ef5675
+ashr 0x238b9dba71e09f4a
+sdiv 0xed434e006bad3d64
+srem 0x2ea46a87a27393f0

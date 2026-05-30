@@ -10,16 +10,22 @@ SOURCE=""
 OUTPUT=""
 WORK_DIR=""
 UOP_BC=""
+UOP_MAP=""
 VIRTUALIZE_LOG=""
 VIRTUALIZED_BC=""
 REBUILD_UOP_VM=0
+REGENERATE_UOP_MAP=0
+UOP_MAP_SEED=""
 KEEP_EVAL=0
+INLINE_VM=0
+LOCALIZE_LOKI_SYMBOLS=0
 MAX_PROCESSES=${LOKI_MAX_PROCESSES:-1}
 VERIFY_ROUNDS=${LOKI_VERIFY_ROUNDS:-0}
 OBFUSCATE_FLAGS=${LOKI_OBFUSCATE_FLAGS---nomba --nosuperopt}
 TARGET_ARGS=()
 CXXFLAGS=()
 LDFLAGS=()
+EXPORT_SYMBOLS=()
 
 usage() {
   cat <<'EOF'
@@ -35,15 +41,26 @@ Target selection options passed to virtualize-uops:
 Build options:
   --work-dir DIR            temporary/cache directory (default: output dir/loki-virtualize)
   --uop-bc PATH             cached obfuscated uop VM bitcode path
+  --uop-map PATH            stable uop opcode/encoding map path
+  --regenerate-uop-map      replace the uop map and rebuild the uop VM
+  --uop-map-seed SEED       deterministic seed used when creating/regenerating a map
   --virtualize-log PATH     virtualize-uops log path
   --virtualized-bc PATH     transformed output bitcode path
   --rebuild-uop-vm          regenerate the obfuscated uop VM bitcode
   --keep-eval               keep the obfuscator eval directory
+  --inline-vm               experimental: llvm-link VM bitcode and run always-inline
+  --hide-loki-symbols       localize Loki VM helper symbols in the output shared library
+  --keep-loki-symbols       compatibility no-op; symbols are kept by default
+  --export-symbol NAME      with --hide-loki-symbols, force a symbol into the export list; may be repeated
   --cxxflag FLAG            extra compile flag for --source; may be repeated
   --ldflag FLAG             extra linker flag; may be repeated
 
 Environment:
   CXX                       clang++ path (default: /llvm/bin/clang++)
+  LLVM_LINK                 llvm-link path
+  OPT                       opt path
+  LLVM_NM                   llvm-nm path
+  OBJCOPY                   objcopy path
   LOKI_MAX_PROCESSES        obfuscator process cap (default: 1)
   LOKI_VERIFY_ROUNDS        obfuscator verification rounds (default: 0)
   LOKI_OBFUSCATE_FLAGS      extra obfuscate.py flags (default: --nomba --nosuperopt)
@@ -72,6 +89,19 @@ while [ "$#" -gt 0 ]; do
       UOP_BC=${2:?--uop-bc requires a path}
       shift 2
       ;;
+    --uop-map)
+      UOP_MAP=${2:?--uop-map requires a path}
+      shift 2
+      ;;
+    --regenerate-uop-map)
+      REGENERATE_UOP_MAP=1
+      REBUILD_UOP_VM=1
+      shift
+      ;;
+    --uop-map-seed)
+      UOP_MAP_SEED=${2:?--uop-map-seed requires a value}
+      shift 2
+      ;;
     --virtualize-log)
       VIRTUALIZE_LOG=${2:?--virtualize-log requires a path}
       shift 2
@@ -87,6 +117,22 @@ while [ "$#" -gt 0 ]; do
     --keep-eval)
       KEEP_EVAL=1
       shift
+      ;;
+    --inline-vm)
+      INLINE_VM=1
+      shift
+      ;;
+    --hide-loki-symbols)
+      LOCALIZE_LOKI_SYMBOLS=1
+      shift
+      ;;
+    --keep-loki-symbols)
+      LOCALIZE_LOKI_SYMBOLS=0
+      shift
+      ;;
+    --export-symbol)
+      EXPORT_SYMBOLS+=("${2:?--export-symbol requires a value}")
+      shift 2
       ;;
     --cxxflag)
       CXXFLAGS+=("${2:?--cxxflag requires a value}")
@@ -144,6 +190,34 @@ if [ ! -x "$CXX" ]; then
   CXX=${CXX_FALLBACK:-clang++}
 fi
 
+resolve_tool() {
+  local requested=$1
+  local fallback=$2
+  if [ -n "$requested" ] && [ -x "$requested" ]; then
+    printf '%s\n' "$requested"
+    return
+  fi
+  if [ -x "$fallback" ]; then
+    printf '%s\n' "$fallback"
+    return
+  fi
+  if command -v "$(basename -- "$fallback")" >/dev/null 2>&1; then
+    command -v "$(basename -- "$fallback")"
+    return
+  fi
+  printf '%s\n' "$requested"
+}
+
+CXX_RESOLVED=$(command -v "$CXX" 2>/dev/null || true)
+if [ -z "$CXX_RESOLVED" ]; then
+  CXX_RESOLVED=$CXX
+fi
+CXX_DIR=$(cd -- "$(dirname -- "$CXX_RESOLVED")" 2>/dev/null && pwd || dirname -- "$CXX_RESOLVED")
+LLVM_LINK=$(resolve_tool "${LLVM_LINK:-}" "$CXX_DIR/llvm-link")
+OPT=$(resolve_tool "${OPT:-}" "$CXX_DIR/opt")
+LLVM_NM=$(resolve_tool "${LLVM_NM:-}" "$CXX_DIR/llvm-nm")
+OBJCOPY=$(resolve_tool "${OBJCOPY:-}" "$(command -v objcopy 2>/dev/null || echo objcopy)")
+
 OUTPUT_PARENT=$(dirname -- "$OUTPUT")
 mkdir -p "$OUTPUT_PARENT"
 OUTPUT_DIR=$(cd -- "$OUTPUT_PARENT" && pwd)
@@ -155,11 +229,21 @@ fi
 if [ -z "$UOP_BC" ]; then
   UOP_BC="$SCRIPT_DIR/bin/uop_dispatch_obf.bc"
 fi
+if [ -z "$UOP_MAP" ]; then
+  UOP_MAP="$SCRIPT_DIR/src/uop_dispatch.map"
+fi
 if [ -z "$VIRTUALIZE_LOG" ]; then
   VIRTUALIZE_LOG="$WORK_DIR/virtualize-uops.log"
 fi
 
-mkdir -p "$WORK_DIR" "$(dirname -- "$UOP_BC")" "$(dirname -- "$VIRTUALIZE_LOG")"
+mkdir -p "$WORK_DIR" "$(dirname -- "$UOP_BC")" "$(dirname -- "$UOP_MAP")" "$(dirname -- "$VIRTUALIZE_LOG")"
+WORK_DIR=$(cd -- "$WORK_DIR" && pwd)
+UOP_BC_DIR=$(cd -- "$(dirname -- "$UOP_BC")" && pwd)
+UOP_BC="$UOP_BC_DIR/$(basename -- "$UOP_BC")"
+UOP_MAP_DIR=$(cd -- "$(dirname -- "$UOP_MAP")" && pwd)
+UOP_MAP="$UOP_MAP_DIR/$(basename -- "$UOP_MAP")"
+VIRTUALIZE_LOG_DIR=$(cd -- "$(dirname -- "$VIRTUALIZE_LOG")" && pwd)
+VIRTUALIZE_LOG="$VIRTUALIZE_LOG_DIR/$(basename -- "$VIRTUALIZE_LOG")"
 
 if [ -n "$SOURCE" ]; then
   INPUT_BC="$WORK_DIR/$(basename -- "${SOURCE%.*}").bc"
@@ -169,9 +253,13 @@ if [ -n "$SOURCE" ]; then
 fi
 
 VIRTUALIZE_UOPS="$SCRIPT_DIR/bin/virtualize-uops"
-UOP_SOURCE="$SCRIPT_DIR/src/uop_dispatch.cpp"
+UOP_SOURCE="$WORK_DIR/uop_dispatch.cpp"
 TEMPLATE_SOURCE="$SCRIPT_DIR/src/template.cpp"
 UOP_EVAL_DIR="$WORK_DIR/uop-dispatch-eval"
+LINKED_BC="$WORK_DIR/${OUTPUT_NAME%.so}.linked.bc"
+INLINED_BC="$WORK_DIR/${OUTPUT_NAME%.so}.linked.inline.bc"
+EXPORTS_FILE="$WORK_DIR/${OUTPUT_NAME%.so}.exports"
+VERSION_SCRIPT="$WORK_DIR/${OUTPUT_NAME%.so}.version"
 if [ -z "$VIRTUALIZED_BC" ]; then
   VIRTUALIZED_BC="$WORK_DIR/${OUTPUT_NAME%.so}.uops.bc"
 fi
@@ -190,7 +278,17 @@ if [ ! -x "$VIRTUALIZE_UOPS" ] || [ "$SCRIPT_DIR/src/virtualize_uops.cpp" -nt "$
   (cd "$SCRIPT_DIR" && ./build.sh)
 fi
 
-if [ "$REBUILD_UOP_VM" -eq 1 ] || [ ! -f "$UOP_BC" ] || [ "$UOP_SOURCE" -nt "$UOP_BC" ] || [ "$TEMPLATE_SOURCE" -nt "$UOP_BC" ]; then
+GENERATOR_ARGS=(--map "$UOP_MAP" --output "$UOP_SOURCE")
+if [ "$REGENERATE_UOP_MAP" -eq 1 ]; then
+  GENERATOR_ARGS+=(--force-map)
+fi
+if [ -n "$UOP_MAP_SEED" ]; then
+  GENERATOR_ARGS+=(--seed "$UOP_MAP_SEED")
+fi
+UOP_GENERATOR="$SCRIPT_DIR/generate_uop_dispatch.py"
+python3 "$UOP_GENERATOR" "${GENERATOR_ARGS[@]}"
+
+if [ "$REBUILD_UOP_VM" -eq 1 ] || [ ! -f "$UOP_BC" ] || [ "$UOP_GENERATOR" -nt "$UOP_BC" ] || [ "$UOP_MAP" -nt "$UOP_BC" ] || [ "$TEMPLATE_SOURCE" -nt "$UOP_BC" ]; then
   rm -rf "$UOP_EVAL_DIR"
   (cd "$LOKI_DIR" && python3 obfuscate.py \
     --testcase-path "$UOP_SOURCE" \
@@ -206,15 +304,65 @@ if [ "$REBUILD_UOP_VM" -eq 1 ] || [ ! -f "$UOP_BC" ] || [ "$UOP_SOURCE" -nt "$UO
   fi
 fi
 
-"$VIRTUALIZE_UOPS" "${TARGET_ARGS[@]}" "$INPUT_BC" "$VIRTUALIZED_BC" >"$VIRTUALIZE_LOG" 2>&1
+"$VIRTUALIZE_UOPS" --op-map "$UOP_MAP" "${TARGET_ARGS[@]}" "$INPUT_BC" "$VIRTUALIZED_BC" >"$VIRTUALIZE_LOG" 2>&1
 cat "$VIRTUALIZE_LOG"
 
+LINK_INPUTS=("$VIRTUALIZED_BC" "$UOP_BC")
+if [ "$INLINE_VM" -eq 1 ]; then
+  if [ ! -x "$LLVM_LINK" ] || [ ! -x "$OPT" ]; then
+    echo "llvm-link/opt unavailable; omit --inline-vm or set LLVM_LINK/OPT" >&2
+    exit 1
+  fi
+  "$LLVM_LINK" "$VIRTUALIZED_BC" "$UOP_BC" -o "$LINKED_BC"
+  "$OPT" -always-inline "$LINKED_BC" -o "$INLINED_BC"
+  LINK_INPUTS=("$INLINED_BC")
+fi
+
+if [ "$LOCALIZE_LOKI_SYMBOLS" -eq 1 ] && [ -x "$LLVM_NM" ]; then
+  {
+    "$LLVM_NM" --defined-only --extern-only "$VIRTUALIZED_BC" \
+      | awk '{print $3}' \
+      | grep -Ev '^(|main|target_function|loki_vm_.*|vm_alu.*)$' || true
+    printf '%s\n' "${EXPORT_SYMBOLS[@]}"
+  } | awk 'NF && !seen[$0]++' >"$EXPORTS_FILE"
+  {
+    echo '{'
+    echo '  global:'
+    if [ -s "$EXPORTS_FILE" ]; then
+      sed 's/.*/    &;/' "$EXPORTS_FILE"
+    fi
+    echo '  local:'
+    echo '    *;'
+    echo '};'
+  } >"$VERSION_SCRIPT"
+  LDFLAGS+=("-Wl,--version-script,$VERSION_SCRIPT")
+fi
+
 "$CXX" -std=c++17 -O1 -fPIC -shared \
-  "$VIRTUALIZED_BC" "$UOP_BC" \
+  "${LINK_INPUTS[@]}" \
   -Wl,-Bsymbolic -Wl,--no-undefined \
   "${LDFLAGS[@]}" \
   -o "$OUTPUT"
 
+if [ "$LOCALIZE_LOKI_SYMBOLS" -eq 1 ] && [ -x "$OBJCOPY" ]; then
+  "$OBJCOPY" --wildcard \
+    --localize-symbol 'loki_vm_*' \
+    --localize-symbol 'vm_alu*' \
+    --localize-symbol 'vm_setup' \
+    --localize-symbol 'vm_exit' \
+    --localize-symbol 'handler_table' \
+    --localize-symbol 'context' \
+    --localize-symbol 'argument_*' \
+    --localize-symbol 'bytecode' \
+    --localize-symbol 'parse_input' \
+    --localize-symbol 'main' \
+    "$OUTPUT"
+fi
+
 echo "built: $OUTPUT"
 echo "using uop VM: $UOP_BC"
+echo "using uop map: $UOP_MAP"
 echo "virtualized bitcode: $VIRTUALIZED_BC"
+if [ "$INLINE_VM" -eq 1 ]; then
+  echo "linked/inlined bitcode: $INLINED_BC"
+fi

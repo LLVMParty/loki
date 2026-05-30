@@ -50,6 +50,8 @@ for line in open(sys.argv[1], encoding="utf-8"):
         continue
     if "call i64 @loki_vm_enter" in line:
         counts[current] += 1
+    if "loki.enc" in line:
+        continue
     if re.search(r"= icmp ", line) or re.search(r"= select ", line) or re.search(r"= (add|sub|mul|xor|and|or|shl|lshr|ashr|udiv|sdiv|urem|srem) ", line):
         residual.append((current, line.strip()))
 if len(counts) != 23:
