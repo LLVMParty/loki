@@ -118,7 +118,7 @@ def c_const(values: dict, key: str) -> str:
     return f"0x{values[key]:016x}ull"
 
 
-def render_cpp(values: dict) -> str:
+def render_cpp(values: dict, batch_cpp: str = "") -> str:
     return f'''#include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -224,7 +224,7 @@ extern "C" uint64_t target_function(uint64_t encoded_op, uint64_t encoded_a, uin
     r |= LOKI_MASK_EQ(op, kOpAShr) & signed_shr;
     r |= LOKI_MASK_EQ(op, kOpSDiv) & signed_div;
     r |= LOKI_MASK_EQ(op, kOpSRem) & signed_rem;
-    return r;
+{batch_cpp}    return r;
 }}
 
 static uint64_t parse_u64(const char* text)
@@ -263,6 +263,8 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path, help="C++ source output path")
     parser.add_argument("--seed", default=None, help="deterministic seed used only when creating a new map")
     parser.add_argument("--force-map", action="store_true", help="regenerate the map even if it exists")
+    parser.add_argument("--batch-cpp", type=Path, default=None,
+                        help="optional generated batch-dispatch C++ snippet")
     args = parser.parse_args()
 
     if args.force_map or not args.map.exists():
@@ -275,8 +277,14 @@ def main() -> None:
     if missing:
         raise SystemExit(f"missing uop map entries: {missing}")
 
+    batch_cpp = ""
+    if args.batch_cpp is not None and args.batch_cpp.exists():
+        batch_cpp = args.batch_cpp.read_text(encoding="utf-8")
+        if batch_cpp and not batch_cpp.endswith("\n"):
+            batch_cpp += "\n"
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    content = render_cpp(values)
+    content = render_cpp(values, batch_cpp)
     if args.output.exists() and args.output.read_bytes().decode("utf-8") == content:
         return
     with args.output.open("w", encoding="utf-8", newline="\n") as output:

@@ -13,10 +13,13 @@ UOP_BC=""
 UOP_MAP=""
 VIRTUALIZE_LOG=""
 VIRTUALIZED_BC=""
+BATCH_CPP=""
 REBUILD_UOP_VM=0
 REGENERATE_UOP_MAP=0
 UOP_MAP_SEED=""
 KEEP_EVAL=0
+ENABLE_BATCH=1
+MAX_BATCH_NODES=12
 INLINE_VM=0
 LOCALIZE_LOKI_SYMBOLS=0
 MAX_PROCESSES=${LOKI_MAX_PROCESSES:-1}
@@ -48,6 +51,8 @@ Build options:
   --virtualized-bc PATH     transformed output bitcode path
   --rebuild-uop-vm          regenerate the obfuscated uop VM bitcode
   --keep-eval               keep the obfuscator eval directory
+  --no-batch                disable target-specific expression batching
+  --max-batch-nodes N       maximum supported instructions per batch (default: 12)
   --inline-vm               experimental: llvm-link VM bitcode and run always-inline
   --hide-loki-symbols       localize Loki VM helper symbols in the output shared library
   --keep-loki-symbols       compatibility no-op; symbols are kept by default
@@ -117,6 +122,14 @@ while [ "$#" -gt 0 ]; do
     --keep-eval)
       KEEP_EVAL=1
       shift
+      ;;
+    --no-batch)
+      ENABLE_BATCH=0
+      shift
+      ;;
+    --max-batch-nodes)
+      MAX_BATCH_NODES=${2:?--max-batch-nodes requires a value}
+      shift 2
       ;;
     --inline-vm)
       INLINE_VM=1
@@ -190,6 +203,11 @@ if [ ! -x "$CXX" ]; then
   CXX=${CXX_FALLBACK:-clang++}
 fi
 
+if ! [[ "$MAX_BATCH_NODES" =~ ^[0-9]+$ ]] || [ "$MAX_BATCH_NODES" -lt 2 ] || [ "$MAX_BATCH_NODES" -gt 64 ]; then
+  echo "--max-batch-nodes must be in [2, 64]" >&2
+  exit 1
+fi
+
 resolve_tool() {
   local requested=$1
   local fallback=$2
@@ -227,7 +245,7 @@ if [ -z "$WORK_DIR" ]; then
   WORK_DIR="$OUTPUT_DIR/loki-virtualize"
 fi
 if [ -z "$UOP_BC" ]; then
-  UOP_BC="$SCRIPT_DIR/bin/uop_dispatch_obf.bc"
+  UOP_BC="$WORK_DIR/uop_dispatch_obf.bc"
 fi
 if [ -z "$UOP_MAP" ]; then
   UOP_MAP="$SCRIPT_DIR/src/uop_dispatch.map"
@@ -256,6 +274,9 @@ VIRTUALIZE_UOPS="$SCRIPT_DIR/bin/virtualize-uops"
 UOP_SOURCE="$WORK_DIR/uop_dispatch.cpp"
 TEMPLATE_SOURCE="$SCRIPT_DIR/src/template.cpp"
 UOP_EVAL_DIR="$WORK_DIR/uop-dispatch-eval"
+if [ -z "$BATCH_CPP" ]; then
+  BATCH_CPP="$WORK_DIR/uop_batches.cpp.inc"
+fi
 LINKED_BC="$WORK_DIR/${OUTPUT_NAME%.so}.linked.bc"
 INLINED_BC="$WORK_DIR/${OUTPUT_NAME%.so}.linked.inline.bc"
 EXPORTS_FILE="$WORK_DIR/${OUTPUT_NAME%.so}.exports"
@@ -288,7 +309,25 @@ fi
 UOP_GENERATOR="$SCRIPT_DIR/generate_uop_dispatch.py"
 python3 "$UOP_GENERATOR" "${GENERATOR_ARGS[@]}"
 
-if [ "$REBUILD_UOP_VM" -eq 1 ] || [ ! -f "$UOP_BC" ] || [ "$UOP_GENERATOR" -nt "$UOP_BC" ] || [ "$UOP_MAP" -nt "$UOP_BC" ] || [ "$TEMPLATE_SOURCE" -nt "$UOP_BC" ]; then
+VIRTUALIZE_ARGS=(--op-map "$UOP_MAP")
+if [ "$ENABLE_BATCH" -eq 1 ]; then
+  VIRTUALIZE_ARGS+=(--batch-cpp "$BATCH_CPP" --max-batch-nodes "$MAX_BATCH_NODES")
+else
+  VIRTUALIZE_ARGS+=(--no-batch)
+  if [ ! -f "$BATCH_CPP" ] || [ -s "$BATCH_CPP" ]; then
+    : >"$BATCH_CPP"
+  fi
+fi
+"$VIRTUALIZE_UOPS" "${VIRTUALIZE_ARGS[@]}" "${TARGET_ARGS[@]}" "$INPUT_BC" "$VIRTUALIZED_BC" >"$VIRTUALIZE_LOG" 2>&1
+cat "$VIRTUALIZE_LOG"
+
+FINAL_GENERATOR_ARGS=(--map "$UOP_MAP" --output "$UOP_SOURCE")
+if [ "$ENABLE_BATCH" -eq 1 ]; then
+  FINAL_GENERATOR_ARGS+=(--batch-cpp "$BATCH_CPP")
+fi
+python3 "$UOP_GENERATOR" "${FINAL_GENERATOR_ARGS[@]}"
+
+if [ "$REBUILD_UOP_VM" -eq 1 ] || [ ! -f "$UOP_BC" ] || [ "$UOP_GENERATOR" -nt "$UOP_BC" ] || [ "$UOP_MAP" -nt "$UOP_BC" ] || [ "$BATCH_CPP" -nt "$UOP_BC" ] || [ "$TEMPLATE_SOURCE" -nt "$UOP_BC" ]; then
   rm -rf "$UOP_EVAL_DIR"
   (cd "$LOKI_DIR" && python3 obfuscate.py \
     --testcase-path "$UOP_SOURCE" \
@@ -303,9 +342,6 @@ if [ "$REBUILD_UOP_VM" -eq 1 ] || [ ! -f "$UOP_BC" ] || [ "$UOP_GENERATOR" -nt "
     rm -rf "$UOP_EVAL_DIR"
   fi
 fi
-
-"$VIRTUALIZE_UOPS" --op-map "$UOP_MAP" "${TARGET_ARGS[@]}" "$INPUT_BC" "$VIRTUALIZED_BC" >"$VIRTUALIZE_LOG" 2>&1
-cat "$VIRTUALIZE_LOG"
 
 LINK_INPUTS=("$VIRTUALIZED_BC" "$UOP_BC")
 if [ "$INLINE_VM" -eq 1 ]; then
@@ -362,6 +398,9 @@ fi
 echo "built: $OUTPUT"
 echo "using uop VM: $UOP_BC"
 echo "using uop map: $UOP_MAP"
+if [ "$ENABLE_BATCH" -eq 1 ]; then
+  echo "using batch semantics: $BATCH_CPP"
+fi
 echo "virtualized bitcode: $VIRTUALIZED_BC"
 if [ "$INLINE_VM" -eq 1 ]; then
   echo "linked/inlined bitcode: $INLINED_BC"
